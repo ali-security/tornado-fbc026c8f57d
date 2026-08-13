@@ -1601,8 +1601,8 @@ class StatusReasonTest(SimpleHandlerTestCase):
     class Handler(RequestHandler):
         def get(self):
             reason = self.request.arguments.get('reason', [])
-            self.set_status(int(self.get_argument('code')),
-                            reason=reason[0] if reason else None)
+            raise HTTPError(int(self.get_argument('code')),
+                            reason=to_unicode(reason[0]) if reason else None)
 
     def get_http_client(self):
         # simple_httpclient only: curl doesn't expose the reason string
@@ -1621,6 +1621,35 @@ class StatusReasonTest(SimpleHandlerTestCase):
         response = self.fetch("/?code=682")
         self.assertEqual(response.code, 682)
         self.assertEqual(response.reason, "Unknown")
+
+    def test_header_injection(self):
+        response = self.fetch("/?code=200&reason=OK%0D%0AX-Injection:injected")
+        self.assertEqual(response.code, 200)
+        self.assertEqual(response.reason, "Unknown")
+        self.assertNotIn("X-Injection", response.headers)
+
+    def test_reason_xss(self):
+        response = self.fetch("/?code=400&reason=<script>alert(1)</script>")
+        self.assertEqual(response.code, 400)
+        self.assertEqual(response.reason, "Unknown")
+        self.assertNotIn(b"script", response.body)
+        self.assertIn(b"Unknown", response.body)
+
+
+@wsgi_safe
+class ErrorPageReasonEscapeTest(SimpleHandlerTestCase):
+    class Handler(RequestHandler):
+        def get(self):
+            # A reason phrase that reaches write_error without passing through
+            # the validation in set_status must still be escaped when it is
+            # rendered into the default error page.
+            self._reason = "<script>alert(1)</script>"
+            self.write_error(400)
+
+    def test_write_error_escapes_reason(self):
+        response = self.fetch("/")
+        self.assertNotIn(b"<script>", response.body)
+        self.assertIn(b"&lt;script&gt;", response.body)
 
 
 @wsgi_safe

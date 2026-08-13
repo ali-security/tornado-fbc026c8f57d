@@ -152,6 +152,12 @@ May be overridden by passing a ``min_version`` keyword argument.
 .. versionadded:: 3.2.1
 """
 
+# RFC 9110 defines the reason phrase of a response as a sequence of HTAB, SP,
+# VCHAR (\x21-\x7e) and obs-text (\x80-\xff) characters. Anything else (in
+# particular CR and LF) could be used to inject additional headers or content
+# into the response.
+_INVALID_REASON_CHARS = re.compile(r"[^\t \x21-\x7e\x80-\xff]")
+
 
 class RequestHandler(object):
     """Base class for HTTP request handlers.
@@ -313,8 +319,10 @@ class RequestHandler(object):
 
         :arg int status_code: Response status code.
         :arg str reason: Human-readable reason phrase describing the status
-            code. If ``None``, it will be filled in from
-            `http.client.responses` or "Unknown".
+            code (for example, the "Not Found" in ``HTTP/1.1 404 Not Found``).
+            Normally determined automatically from `http.client.responses`; this
+            argument should only be used if you need to use a non-standard
+            status code.
 
         .. versionchanged:: 5.0
 
@@ -323,7 +331,16 @@ class RequestHandler(object):
         """
         self._status_code = status_code
         if reason is not None:
-            self._reason = escape.native_str(reason)
+            reason = escape.native_str(reason)
+            if not reason or "<" in reason or _INVALID_REASON_CHARS.search(reason):
+                # Logically this would be better as an exception, but this method
+                # is called on error-handling paths that would need some refactoring
+                # to tolerate internal errors cleanly.
+                #
+                # The check for "<" is a defense-in-depth against XSS attacks (we also
+                # escape the reason when rendering error pages).
+                reason = "Unknown"
+            self._reason = reason
         else:
             self._reason = httputil.responses.get(status_code, "Unknown")
 
@@ -1125,7 +1142,8 @@ class RequestHandler(object):
                 reason = exception.reason
         self.set_status(status_code, reason=reason)
         try:
-            self.write_error(status_code, **kwargs)
+            if status_code != 304:
+                self.write_error(status_code, **kwargs)
         except Exception:
             app_log.error("Uncaught exception in write_error", exc_info=True)
         if not self._finished:
@@ -1153,7 +1171,7 @@ class RequestHandler(object):
             self.finish("<html><title>%(code)d: %(message)s</title>"
                         "<body>%(code)d: %(message)s</body></html>" % {
                             "code": status_code,
-                            "message": self._reason,
+                            "message": escape.xhtml_escape(self._reason),
                         })
 
     @property
@@ -2275,9 +2293,11 @@ class HTTPError(Exception):
         mode).  May contain ``%s``-style placeholders, which will be filled
         in with remaining positional parameters.
     :arg str reason: Keyword-only argument.  The HTTP "reason" phrase
-        to pass in the status line along with ``status_code``.  Normally
+        to pass in the status line along with ``status_code`` (for example,
+        the "Not Found" in ``HTTP/1.1 404 Not Found``).  Normally
         determined automatically from ``status_code``, but can be used
-        to use a non-standard numeric code.
+        to use a non-standard numeric code. This is not a general-purpose
+        error message.
     """
     def __init__(self, status_code=500, log_message=None, *args, **kwargs):
         self.status_code = status_code
