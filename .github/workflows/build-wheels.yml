@@ -1,0 +1,178 @@
+name: Build Windows Wheels
+
+on:
+  workflow_dispatch:  # Allow manual triggers
+
+jobs:
+  build-windows-wheels:
+    name: Build tornado-5.1.1 - Python ${{ matrix.python-version }} (${{ matrix.arch-name }})
+    runs-on: windows-2022
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Python 3.5 - 32-bit and 64-bit
+          - python-version: '3.5'
+            arch: 'x86'
+            arch-name: 'win32'
+            vcvars-arch: 'x86'
+          - python-version: '3.5'
+            arch: 'x64'
+            arch-name: 'win_amd64'
+            vcvars-arch: 'amd64'
+
+          # Python 3.6 - 32-bit and 64-bit
+          - python-version: '3.6'
+            arch: 'x86'
+            arch-name: 'win32'
+            vcvars-arch: 'x86'
+          - python-version: '3.6'
+            arch: 'x64'
+            arch-name: 'win_amd64'
+            vcvars-arch: 'amd64'
+
+          # Python 3.7 - 32-bit and 64-bit
+          - python-version: '3.7'
+            arch: 'x86'
+            arch-name: 'win32'
+            vcvars-arch: 'x86'
+          - python-version: '3.7'
+            arch: 'x64'
+            arch-name: 'win_amd64'
+            vcvars-arch: 'amd64'
+
+    env:
+      TORNADO_EXTENSION: "1"
+
+    steps:
+    # The released wheels ship LF-terminated sources; a default Windows checkout
+    # applies core.autocrlf=true and every packed .py would differ from PyPI.
+    - name: Keep LF line endings on checkout
+      run: |
+        git config --global core.autocrlf false
+        git config --global core.eol lf
+
+    - uses: actions/checkout@v4
+
+    - name: Set up Python ${{ matrix.python-version }} (${{ matrix.arch }})
+      uses: actions/setup-python@v5
+      with:
+        python-version: ${{ matrix.python-version }}
+        architecture: ${{ matrix.arch }}
+
+    - name: Display Python version and architecture
+      run: |
+        python --version
+        python -c "import struct; print('Architecture:', struct.calcsize('P') * 8, 'bit')"
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --index-url https://:2018-09-16T19:22:58.819187Z@time-machines-pypi.sealsecurity.io/ --disable-pip-version-check --user --upgrade pip
+        python -m pip install --index-url https://:2018-09-16T19:22:58.819187Z@time-machines-pypi.sealsecurity.io/ tox wheel
+
+    # cp35/cp36/cp37 were released off the VS2015 (v140) toolset, whose
+    # vcruntime.lib supplies memcpy/memset — hence the VCRUNTIME140.dll import in
+    # the published speedups.pyd. Every toolset preinstalled on windows-2022
+    # (v143, and v142/14.29) resolves them from the UCRT instead and imports
+    # api-ms-win-crt-{string,heap}, so v140 has to be added to the image.
+    # cp35/cp36/cp37 were released off the VS2015 (v140) toolset, whose
+    # VCRUNTIME140.dll supplies memcpy/memset — hence the vcruntime140.dll import
+    # in the published speedups.pyd. Every toolset preinstalled on windows-2022
+    # (v143, v142/14.29) resolves them from the UCRT instead, so the rebuilt .pyd
+    # imports api-ms-win-crt-{string,heap} and no vcruntime140. v140 is not on the
+    # image any more, so add it as a VS2022 component before setting up the
+    # environment.
+    # v140 cannot compile the image's current SDK headers (10.0.26100's wchar.h
+    # uses the _mm_loadu_si64 intrinsic VS2015 doesn't know: "error C2440:
+    # cannot convert from 'int' to '__m128i'"), so an era-appropriate SDK comes
+    # in with it and the setup step below pins the oldest one installed.
+    - name: Install the MSVC v140 (VS2015) toolset and an older Windows SDK
+      id: msvc140
+      shell: pwsh
+      run: |
+        $installer = "C:\Program Files (x86)\Microsoft Visual Studio\Installer\vs_installer.exe"
+        $installPath = "C:\Program Files\Microsoft Visual Studio\2022\Enterprise"
+        # One component per invocation: an ID this installer build no longer
+        # offers fails only its own call instead of dropping v140 with it.
+        foreach ($component in @(
+            "Microsoft.VisualStudio.Component.VC.140",
+            "Microsoft.VisualStudio.Component.Windows10SDK.16299",
+            "Microsoft.VisualStudio.Component.Windows10SDK.17134",
+            "Microsoft.VisualStudio.Component.Windows10SDK.18362",
+            "Microsoft.VisualStudio.Component.Windows10SDK.19041"
+        )) {
+          $p = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
+            "modify", "--installPath", "`"$installPath`"",
+            "--add", $component, "--quiet", "--norestart", "--nocache"
+          )
+          Write-Host "$component -> vs_installer exit code $($p.ExitCode)"
+        }
+        $cl = "C:\Program Files (x86)\Microsoft Visual Studio 14.0\VC\bin\cl.exe"
+        if (-not (Test-Path $cl)) {
+          Write-Host "v140 cl.exe not found at $cl"
+          exit 1
+        }
+        $kitRoot = "C:\Program Files (x86)\Windows Kits\10"
+        # The image ships a partial 10.0.10240.0 (ucrt headers but no um/), and
+        # vcvarsall rejects it: "Windows SDK 10.0.10240.0 : ...\um not found or
+        # was incomplete" — so an SDK only counts when its um headers and ucrt
+        # libs are both there.
+        $sdks = Get-ChildItem (Join-Path $kitRoot "include") -Directory |
+          Where-Object {
+            (Test-Path (Join-Path $_.FullName "ucrt\wchar.h")) -and
+            (Test-Path (Join-Path $_.FullName "um\windows.h")) -and
+            (Test-Path (Join-Path $kitRoot "lib\$($_.Name)\ucrt"))
+          } |
+          Sort-Object { [version]$_.Name }
+        Write-Host "SDKs on the image: $($sdks.Name -join ', ')"
+        $oldest = $sdks[0].Name
+        if ([version]$oldest -ge [version]"10.0.26100.0") {
+          Write-Host "no v140-compatible Windows SDK was installed"
+          exit 1
+        }
+        Write-Host "v140 toolset present, using SDK $oldest"
+        "sdk=$oldest" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+    # The 10.0.20348.0 SDK this step used to pin has been removed from the
+    # windows-2022 image ("Windows SDK 10.0.20348.0 ... not found or was
+    # incomplete"), so the SDK comes from the step above instead of a literal.
+    - name: Set up MSVC (v140 toolset)
+      uses: ilammy/msvc-dev-cmd@v1
+      with:
+        arch: ${{ matrix.vcvars-arch }}
+        toolset: '14.0'
+        sdk: ${{ steps.msvc140.outputs.sdk }}
+
+    - name: Build wheel
+      shell: cmd
+      env:
+        DISTUTILS_USE_SDK: "1"
+        MSSdk: "1"
+        # The published speedups.pyd imports VCRUNTIME140.dll, i.e. it was linked
+        # against the dynamic CRT, but python 3.5's distutils hardcodes /MT and
+        # then links the static CRT. cl.exe appends _CL_ after the command line,
+        # so /MD wins over the /MT distutils passes, without touching setup.py
+        # (which ships inside the sdist and must stay byte-identical).
+        # Overriding the linker instead (LINK=/nodefaultlib:libvcruntime.lib
+        # vcruntime.lib) works on x64 but cannot work on x86: the static LIBCMT
+        # still gets linked and its __except_handler4 has no counterpart in the
+        # vcruntime import lib, so every win32 leg dies on LNK2001.
+        _CL_: "/MD"
+      run: |
+        python setup.py bdist_wheel
+
+    - name: List built wheels
+      run: |
+        dir dist\
+
+    - name: Verify wheel name
+      run: |
+        python -c "import os; files = os.listdir('dist'); print('Built:', files[0] if files else 'No files'); pyver = '${{ matrix.python-version }}'.replace('.', ''); expected = 'tornado-5.1.1-cp' + pyver + 'm-cp' + pyver + 'm-${{ matrix.arch-name }}.whl'; print('Expected: ' + expected)"
+
+    - name: Upload wheels as artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: tornado-windows-wheels-py${{ matrix.python-version }}-${{ matrix.arch-name }}
+        path: dist/*.whl
+        if-no-files-found: error
