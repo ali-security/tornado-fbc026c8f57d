@@ -275,6 +275,32 @@ Foo
         self.assertEqual(file["filename"], "ab.txt")
         self.assertEqual(file["body"], b"Foo")
 
+    def test_disposition_param_linear_performance(self):
+        # This is a regression test for performance of parsing parameters
+        # to the content-disposition header, specifically for semicolons within
+        # quoted strings.
+        def f(n):
+            start = time.time()
+            message = (
+                b"--1234\r\nContent-Disposition: form-data; "
+                + b'x="'
+                + b";" * n
+                + b'"; '
+                + b'name="files"; filename="a.txt"\r\n\r\nFoo\r\n--1234--\r\n'
+            )
+            args = {}
+            files = {}
+            parse_multipart_form_data(b"1234", message, args, files)
+            return time.time() - start
+
+        # Once the parsing is linear each call takes well under a millisecond,
+        # so use the fastest of a few attempts: a single scheduler or gc pause
+        # on a shared build machine would otherwise skew the ratio.
+        d1 = min(f(1000) for _ in range(3))
+        d2 = min(f(10000) for _ in range(3))
+        if d2 / d1 > 20:
+            self.fail("Disposition param parsing is not linear: d1=%r vs d2=%r" % (d1, d2))
+
 
 class HTTPHeadersTest(unittest.TestCase):
     def test_multi_line(self):
